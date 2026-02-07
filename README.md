@@ -1,16 +1,22 @@
 # windi-forensics-engine
 
-Audit trail e replay determinístico para o WINDI.
+Audit trail e replay determinístico para o WINDI — **nível prova pericial**.
 
 Part of the **WINDI** (Worldwide Infrastructure for Non-repudiable Document Integrity) ecosystem.
 
-## Features (MVP)
+## Features
 
-- **Append-only event log** por document_id
-- **Cadeia hash encadeada** (prev_hash → event_hash)
-- **verifyChain()** detecta adulteração
-- **replay()** reconstrói estado final (verify/policy/payment)
-- **Adapters**: in-memory agora; pronto para Postgres/SQLite
+| Feature | Status |
+|---------|--------|
+| Append-only event log | ✅ |
+| Hash chain (prev_hash → event_hash) | ✅ |
+| verifyChain() tampering detection | ✅ |
+| replay() state reconstruction | ✅ |
+| MemoryStore adapter | ✅ |
+| **PostgresStore adapter** | ✅ |
+| **Institutional attestation (signed head)** | ✅ |
+| **WCAF Bundle export (portable audit)** | ✅ |
+| **Bundle signature verification** | ✅ |
 
 ## Installation
 
@@ -18,44 +24,43 @@ Part of the **WINDI** (Worldwide Infrastructure for Non-repudiable Document Inte
 npm install windi-forensics-engine
 ```
 
-## Usage
+## Quick Start
 
 ```js
 const { createForensics, EventTypes } = require("windi-forensics-engine");
+const crypto = require("crypto");
 
-const fx = createForensics();
+// Generate institutional keys (in production, use HSM/KMS)
+const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  publicKeyEncoding: { type: "spki", format: "pem" },
+  privateKeyEncoding: { type: "pkcs8", format: "pem" }
+});
 
-// Append verification result
+const fx = createForensics({
+  keyId: "windi-root-2026",
+  privateKey,
+  publicKey
+});
+
+// Append events
 await fx.appendEvent({
   document_id: "INV-2025-0001",
   type: EventTypes.VERIFY_RESULT,
-  payload: { verdict: "VALID", integrity: "INTACT", trust_level: "HIGH" },
+  payload: { verdict: "VALID", trust_level: "HIGH" },
   actor: { system: "verification-api", instance_id: "api-1" }
 });
 
-// Append policy decision
 await fx.appendEvent({
   document_id: "INV-2025-0001",
   type: EventTypes.POLICY_DECISION,
-  payload: { decision: "ALLOW", reason_codes: [] },
+  payload: { decision: "ALLOW", policy_version: "bank-v3.2" },
   actor: { system: "policy-engine", instance_id: "pe-1" }
 });
 
-// Get timeline and verify chain integrity
-const timeline = await fx.getTimeline({ document_id: "INV-2025-0001" });
-const check = fx.verifyChain(timeline);
-console.log(check); // { ok: true, problems: [] }
-
-// Replay to get final state
-const state = fx.replay(timeline);
-console.log(state);
-// {
-//   document_id: "INV-2025-0001",
-//   verify: { verdict: "VALID", ... },
-//   policy: { decision: "ALLOW", ... },
-//   payment: null,
-//   notes: []
-// }
+// Export audit bundle (with attestation and signature)
+const bundle = await fx.exportAuditBundle("INV-2025-0001");
+console.log(JSON.stringify(bundle, null, 2));
 ```
 
 ## Event Types
@@ -64,57 +69,130 @@ console.log(state);
 |------|-------------|
 | `VERIFY_CALLED` | Verification API was called |
 | `VERIFY_RESULT` | Verification result received |
-| `POLICY_DECISION` | Policy engine decision |
+| `POLICY_DECISION` | Policy engine decision (include `policy_version`) |
 | `PAYMENT_ACTION` | Payment executed/held/blocked |
 | `NOTE` | Manual annotation |
 
-## Event Structure (WCAF)
+## WCAF Event Structure
 
 ```json
 {
   "event_id": "uuid",
   "ts": "2026-02-08T12:00:00Z",
   "document_id": "INV-2025-0001",
-  "type": "VERIFY_RESULT",
+  "type": "POLICY_DECISION",
   "actor": {
-    "system": "verification-api",
-    "instance_id": "api-1"
+    "system": "policy-engine",
+    "instance_id": "pe-1"
   },
-  "payload": { ... },
-  "prev_hash": "sha256:...",
-  "event_hash": "sha256:..."
+  "payload": {
+    "decision": "ALLOW",
+    "policy_version": "bank-v3.2"
+  },
+  "prev_hash": "abc123...",
+  "event_hash": "def456...",
+  "schema_version": "wcaf-1.0"
 }
 ```
 
-## Chain Verification
+## Institutional Attestation
 
-The engine maintains a hash chain:
+Create cryptographic proof that the chain state was certified by the WINDI operator:
 
+```js
+const attestation = await fx.createAttestation({
+  document_id: "INV-2025-0001"
+});
+
+// Verify attestation
+const isValid = fx.verifyAttestation(attestation);
 ```
-GENESIS → event_hash[0] → event_hash[1] → event_hash[2] → ...
+
+### Attestation Structure
+
+```json
+{
+  "document_id": "INV-2025-0001",
+  "head_event_hash": "abc123...",
+  "attested_at": "2026-02-08T12:45:22Z",
+  "signature_alg": "RSA-SHA256",
+  "signature": "base64...",
+  "key_id": "windi-root-2026",
+  "schema_version": "wcaf-attestation-1.0"
+}
 ```
 
-Each event stores:
-- `prev_hash`: hash of the previous event (or "GENESIS")
-- `event_hash`: SHA-256 of the canonicalized event core
+## WCAF Bundle Export
 
-**Tampering detection:**
-- If any event is modified, `verifyChain()` returns `{ ok: false, problems: [...] }`
-- Problems include `CHAIN_BREAK` (prev_hash mismatch) and `HASH_MISMATCH` (content changed)
+Create a portable, self-contained audit package:
 
-## Integration with WINDI Flow
+```js
+const timeline = await fx.getTimeline({ document_id: "INV-2025-0001" });
+const bundle = fx.createBundle({ timeline, attestation });
 
+// Or use the convenience method (includes attestation + signature)
+const fullBundle = await fx.exportAuditBundle("INV-2025-0001");
+
+// Verify bundle
+const result = fx.verifyBundle(fullBundle);
+console.log(result.ok); // true
 ```
-SDK → Verification API → Policy Engine → Bank Core
-         │                    │              │
-         ▼                    ▼              ▼
-    VERIFY_RESULT      POLICY_DECISION  PAYMENT_ACTION
-         │                    │              │
-         └────────────────────┴──────────────┘
-                              │
-                              ▼
-                    Forensics Engine (append)
+
+### Bundle Structure
+
+```json
+{
+  "bundle_version": "wcaf-bundle-1.0",
+  "document_id": "INV-2025-0001",
+  "created_at": "2026-02-08T13:00:00Z",
+
+  "timeline": [ /* events */ ],
+
+  "chain_verification": {
+    "verified": true,
+    "head_event_hash": "...",
+    "event_count": 3
+  },
+
+  "attestation": {
+    "attested_at": "...",
+    "head_event_hash": "...",
+    "signature_alg": "RSA-SHA256",
+    "signature": "...",
+    "key_id": "windi-root-2026"
+  },
+
+  "bundle_signature": {
+    "alg": "RSA-SHA256",
+    "key_id": "windi-root-2026",
+    "signature": "...",
+    "signed_hash": "..."
+  }
+}
 ```
+
+## PostgreSQL Storage
+
+For production use:
+
+```js
+const { Pool } = require("pg");
+const { createForensics, PostgresStore } = require("windi-forensics-engine");
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const store = new PostgresStore(pool);
+
+const fx = createForensics({ store, keyId: "...", privateKey: "..." });
+```
+
+### SQL Schema
+
+See `sql/001_wcaf_schema.sql` for the complete schema including:
+
+- `wcaf_events` — Append-only event table with UPDATE/DELETE prevention
+- `wcaf_attestations` — Institutional signatures
+- `wcaf_chain_heads` — View for latest event per document
+- `wcaf_verify_chain()` — Server-side chain verification function
 
 ## Testing
 
@@ -122,27 +200,45 @@ SDK → Verification API → Policy Engine → Bank Core
 npm test
 ```
 
-## Position in the WINDI Architecture
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    WINDI Ecosystem                       │
-├─────────────────────────────────────────────────────────┤
-│  windi-reader-sdk        — Client SDK                    │
-│  windi-policy-engine     — Risk decisions                │
-│  windi-proof-spec        — Proof specification           │
-│  windi-verification-api  — Backend API                   │
-│  windi-forensics-engine ◄── YOU ARE HERE                │
-│  windi-wcaf-toolkit      — Compliance CLI                │
-│  windi-core-reference    — Architecture docs             │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                  WINDI Forensics Engine                      │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  appendEvent() ──────────────────────────────────────┐      │
+│       │                                               │      │
+│       ▼                                               ▼      │
+│  ┌─────────┐    ┌─────────────┐    ┌──────────────────────┐ │
+│  │ Events  │───▶│ Hash Chain  │───▶│ Attestation (signed) │ │
+│  │ (WCAF)  │    │ prev→hash   │    │ head_event_hash      │ │
+│  └─────────┘    └─────────────┘    └──────────────────────┘ │
+│       │                                       │              │
+│       ▼                                       ▼              │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │                    WCAF Bundle                          ││
+│  │  timeline + chain_verification + attestation + signature││
+│  └─────────────────────────────────────────────────────────┘│
+│                                                              │
+│  Storage Adapters:                                           │
+│  ┌──────────────┐  ┌──────────────┐                         │
+│  │ MemoryStore  │  │ PostgresStore│                         │
+│  │ (testing)    │  │ (production) │                         │
+│  └──────────────┘  └──────────────┘                         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Related Repositories
+## What This Proves
 
-- [windi-verification-api](https://github.com/Bingo-APPweb/windi-verification-api) — Verification API
-- [windi-policy-engine](https://github.com/Bingo-APPweb/windi-policy-engine) — Policy Engine
-- [windi-wcaf-toolkit](https://github.com/Bingo-APPweb/windi-wcaf-toolkit) — WCAF CLI
+| Layer | What It Proves |
+|-------|----------------|
+| Hash Chain | Technical integrity (no tampering) |
+| verifyChain() | Chain continuity |
+| Attestation | Institutional authorship |
+| Bundle Signature | Complete package integrity |
+| policy_version | Which rules produced the decision |
+| schema_version | Future compatibility |
 
 ## License
 
